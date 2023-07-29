@@ -35,6 +35,15 @@ const Machine = struct {
     ptr: usize, // address pointer (current cell)
     pc: usize, // program counter (current instruction)
 
+    const LoopMap = struct {
+        left2right: std.AutoHashMap(usize, usize),
+        right2left: std.AutoHashMap(usize, usize),
+        fn deinit(self: *LoopMap) void {
+            self.left2right.deinit();
+            self.right2left.deinit();
+        }
+    };
+
     fn init(self: *Machine, allocator: std.mem.Allocator) void {
         self.tape = std.ArrayList(u8).init(allocator);
         self.ptr = 0;
@@ -48,9 +57,11 @@ const Machine = struct {
     }
 
     // collect the loop match
-    fn scan(src: []const u8, allocator: std.mem.Allocator) Error!std.AutoHashMap(usize, usize) {
+    fn scan(src: []const u8, allocator: std.mem.Allocator) Error!LoopMap {
         var stack = std.ArrayList(usize).init(allocator);
-        var map = std.AutoHashMap(usize, usize).init(allocator);
+        defer stack.deinit();
+        var left2right = std.AutoHashMap(usize, usize).init(allocator);
+        var right2left = std.AutoHashMap(usize, usize).init(allocator);
         for (src, 0..) |c, i| {
             if (c == '[') {
                 stack.append(i) catch {
@@ -58,8 +69,12 @@ const Machine = struct {
                 };
             }
             if (c == ']') {
-                if (stack.popOrNull()) |j| {
-                    map.put(j, i) catch {
+                const right = i;
+                if (stack.popOrNull()) |left| {
+                    left2right.put(left, right) catch {
+                        return Error.OutofMemory;
+                    };
+                    right2left.put(right, left) catch {
                         return Error.OutofMemory;
                     };
                 } else {
@@ -67,7 +82,7 @@ const Machine = struct {
                 }
             }
         }
-        return map;
+        return LoopMap{ .left2right = left2right, .right2left = right2left };
     }
 
     // run a single line of code
@@ -75,18 +90,17 @@ const Machine = struct {
         self.init(allocator);
         defer self.deinit();
         const len = src.len;
-        const map = try scan(src, allocator);
+        var map = try scan(src, allocator);
+        defer map.deinit();
 
         while (self.pc < len) {
             const inst = try Instruction.translate(src[self.pc]);
-            self.pc += 1;
             try self.exec(inst, &map);
+            self.pc += 1;
         }
     }
 
-    fn exec(self: *Machine, inst: Instruction, map: *const std.AutoHashMap(usize, usize)) !void {
-        _ = map;
-
+    fn exec(self: *Machine, inst: Instruction, map: *const LoopMap) !void {
         if (self.ptr >= self.tape.items.len) {
             try self.tape.append(0);
         }
@@ -120,9 +134,25 @@ const Machine = struct {
                 const value = self.tape.items[self.ptr];
                 try stdout.print("{c}", .{value});
             },
-            else => {
-                return Error.InvalidInstr;
+            .begin => {
+                const value = self.tape.items[self.ptr];
+                if (value != 0) return; // do nothing
+                if (map.left2right.get(self.pc)) |next| {
+                    self.pc = next;
+                } else {
+                    return Error.InvalidProgram;
+                }
             },
+            .end => {
+                const value = self.tape.items[self.ptr];
+                if (value == 0) return; // do nothing
+                if (map.right2left.get(self.pc)) |next| {
+                    self.pc = next;
+                } else {
+                    return Error.InvalidProgram;
+                }
+            },
+            else => return Error.InvalidInstr,
         }
     }
 };
@@ -145,7 +175,7 @@ pub fn main() !void {
     try stdout.print("Welcome to zfk\n", .{});
     while (true) {
         try stdout.print("zfk:>> ", .{});
-        var buf: [100]u8 = undefined;
+        var buf: [1000]u8 = undefined;
 
         if (try stdin.readUntilDelimiterOrEof(buf[0..], '\n')) |code| {
             machine.init(gpa);
@@ -155,9 +185,4 @@ pub fn main() !void {
     }
 }
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+test "simple test" {}
