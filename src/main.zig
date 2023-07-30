@@ -169,7 +169,6 @@ pub fn main() !void {
         .ptr = undefined,
         .pc = undefined,
     };
-    defer machine.deinit();
 
     //=================================================
     try stdout.print("Welcome to zfk\n", .{});
@@ -178,7 +177,6 @@ pub fn main() !void {
         var buf: [1000]u8 = undefined;
 
         if (try stdin.readUntilDelimiterOrEof(buf[0..], '\n')) |code| {
-            machine.init(gpa);
             try machine.run(code, gpa);
             try stdout.print("\n", .{});
         }
