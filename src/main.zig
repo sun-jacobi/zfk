@@ -2,8 +2,9 @@ const std = @import("std");
 
 const stdout = std.io.getStdOut().writer();
 const stdin = std.io.getStdIn().reader();
+const assert = std.debug.assert;
 
-const Error = error{ OutofMemory, InvalidInstr, InvalidProgram, PtrOutScope };
+const Error = error{ OutofMemory, InvalidInstr, InvalidProgram, PtrOutScope, EOF };
 
 const Instruction = enum {
     left, // move the pointer left
@@ -24,16 +25,23 @@ const Instruction = enum {
             ',' => .read,
             '[' => .begin,
             ']' => .end,
-            else => Error.InvalidInstr,
+            else => {
+                return Error.InvalidInstr;
+            },
         };
     }
 };
 
 const Machine = struct {
-    tape: std.ArrayList(u8),
+    left_tape: std.ArrayList(u8),
+    right_tape: std.ArrayList(u8),
 
-    ptr: usize, // address pointer (current cell)
+    negative: bool, // use or not left tape
+    left_ptr: usize, // address pointer for left tape
+    right_ptr: usize, // address pointer for right tape
     pc: usize, // program counter (current instruction)
+
+    cursor: usize, // input pointer
 
     const LoopMap = struct {
         left2right: std.AutoHashMap(usize, usize),
@@ -45,15 +53,23 @@ const Machine = struct {
     };
 
     fn init(self: *Machine, allocator: std.mem.Allocator) void {
-        self.tape = std.ArrayList(u8).init(allocator);
-        self.ptr = 0;
+        self.left_tape = std.ArrayList(u8).init(allocator);
+        self.right_tape = std.ArrayList(u8).init(allocator);
+        self.negative = false;
+        self.left_ptr = 1;
+        self.right_ptr = 0;
         self.pc = 0;
+        self.cursor = 0;
     }
 
     fn deinit(self: *Machine) void {
-        self.tape.deinit();
-        self.ptr = 0;
-        self.pc = 0;
+        self.left_tape.deinit();
+        self.right_tape.deinit();
+        self.left_ptr = undefined;
+        self.right_ptr = undefined;
+        self.negative = false;
+        self.pc = undefined;
+        self.cursor = undefined;
     }
 
     // collect the loop match
@@ -86,7 +102,7 @@ const Machine = struct {
     }
 
     // run a single line of code
-    fn run(self: *Machine, src: []const u8, allocator: std.mem.Allocator) !void {
+    fn run(self: *Machine, src: []const u8, input: []const u8, allocator: std.mem.Allocator) !void {
         self.init(allocator);
         defer self.deinit();
         const len = src.len;
@@ -95,47 +111,102 @@ const Machine = struct {
 
         while (self.pc < len) {
             const inst = try Instruction.translate(src[self.pc]);
-            try self.exec(inst, &map);
+
+            try self.exec(inst, &map, input);
             self.pc += 1;
         }
     }
 
-    fn exec(self: *Machine, inst: Instruction, map: *const LoopMap) !void {
-        if (self.ptr >= self.tape.items.len) {
-            try self.tape.append(0);
+    fn read_tape(self: Machine) u8 {
+        if (self.negative) {
+            return self.left_tape.items[self.left_ptr - 1];
+        } else {
+            return self.right_tape.items[self.right_ptr];
+        }
+    }
+
+    fn write_tape(self: *Machine, val: u8) void {
+        if (self.negative) {
+            self.left_tape.items[self.left_ptr - 1] = val;
+        } else {
+            self.right_tape.items[self.right_ptr] = val;
+        }
+    }
+
+    fn move_right(self: *Machine) !void {
+        if (self.negative) {
+            if (self.left_ptr == 1) {
+                self.negative = false; // start using right tape
+                assert(self.right_ptr == 0);
+            } else {
+                self.left_ptr -= 1;
+            }
+        } else {
+            const res = @addWithOverflow(self.right_ptr, 1);
+            if (res[1] == 0) {
+                self.right_ptr = res[0];
+            } else {
+                return Error.PtrOutScope;
+            }
+        }
+    }
+
+    fn move_left(self: *Machine) !void {
+        if (!self.negative) {
+            if (self.right_ptr == 0) {
+                self.negative = true; // start using left tape
+                assert(self.left_ptr == 1);
+            } else {
+                self.right_ptr -= 1;
+            }
+        } else {
+            const res = @addWithOverflow(self.left_ptr, 1);
+            if (res[1] == 0) {
+                self.left_ptr = res[0];
+            } else {
+                return Error.PtrOutScope;
+            }
+        }
+    }
+
+    fn exec(self: *Machine, inst: Instruction, map: *const LoopMap, input: []const u8) !void {
+        if (self.negative and self.left_ptr - 1 >= self.left_tape.items.len) {
+            try self.left_tape.append(0);
+        } else if (self.right_ptr >= self.right_tape.items.len) {
+            try self.right_tape.append(0);
         }
 
         switch (inst) {
             .left => {
-                const res = @subWithOverflow(self.ptr, 1);
-                if (res[1] == 0) {
-                    self.ptr = res[0];
-                } else {
-                    return Error.PtrOutScope;
-                }
+                return self.move_left();
             },
             .right => {
-                const res = @addWithOverflow(self.ptr, 1);
-                if (res[1] == 0) {
-                    self.ptr = res[0];
-                } else {
-                    return Error.PtrOutScope;
-                }
+                return self.move_right();
             },
             .incr => {
-                const prev = self.tape.items[self.ptr];
-                self.tape.items[self.ptr] = @addWithOverflow(prev, 1)[0];
+                const prev = self.read_tape();
+                self.write_tape(@addWithOverflow(prev, 1)[0]);
             },
             .decr => {
-                const prev = self.tape.items[self.ptr];
-                self.tape.items[self.ptr] = @subWithOverflow(prev, 1)[0];
+                const prev = self.read_tape();
+                self.write_tape(@subWithOverflow(prev, 1)[0]);
             },
             .write => {
-                const value = self.tape.items[self.ptr];
+                const value = self.read_tape();
                 try stdout.print("{c}", .{value});
             },
+            .read => {
+                if (self.cursor >= input.len) {
+                    return Error.EOF;
+                }
+                const value = input[self.cursor];
+                self.cursor += 1;
+
+                self.write_tape(value);
+            },
+
             .begin => {
-                const value = self.tape.items[self.ptr];
+                const value = self.read_tape();
                 if (value != 0) return; // do nothing
                 if (map.left2right.get(self.pc)) |next| {
                     self.pc = next;
@@ -143,8 +214,9 @@ const Machine = struct {
                     return Error.InvalidProgram;
                 }
             },
+
             .end => {
-                const value = self.tape.items[self.ptr];
+                const value = self.read_tape();
                 if (value == 0) return; // do nothing
                 if (map.right2left.get(self.pc)) |next| {
                     self.pc = next;
@@ -152,7 +224,6 @@ const Machine = struct {
                     return Error.InvalidProgram;
                 }
             },
-            else => return Error.InvalidInstr,
         }
     }
 };
@@ -165,20 +236,33 @@ pub fn main() !void {
 
     // setup the brainfuck machine
     var machine = Machine{
-        .tape = undefined,
-        .ptr = undefined,
+        .left_tape = undefined,
+        .right_tape = undefined,
+        .negative = undefined,
+        .left_ptr = undefined,
+        .right_ptr = undefined,
         .pc = undefined,
+        .cursor = undefined,
     };
 
     //=================================================
     try stdout.print("Welcome to zfk\n", .{});
     while (true) {
-        try stdout.print("zfk:>> ", .{});
-        var buf: [1000]u8 = undefined;
+        try stdout.print("program:>> ", .{});
+        var pbuf: [1000]u8 = undefined;
+        var ibuf: [1000]u8 = undefined;
 
-        if (try stdin.readUntilDelimiterOrEof(buf[0..], '\n')) |code| {
-            try machine.run(code, gpa);
-            try stdout.print("\n", .{});
+        if (try stdin.readUntilDelimiterOrEof(pbuf[0..], '\n')) |code| {
+            try stdout.print("input:>> ", .{});
+            if (try stdin.readUntilDelimiterOrEof(ibuf[0..], '\n')) |input| {
+                if (machine.run(code, input, gpa)) {} else |err| switch (err) {
+                    Error.EOF => {},
+                    else => {
+                        try stdout.print("{}", .{err});
+                    },
+                }
+                try stdout.print("\n", .{});
+            }
         }
     }
 }
