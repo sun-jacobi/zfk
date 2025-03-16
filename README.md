@@ -1,4 +1,4 @@
-# A Brainfuck Interpreter in Zig
+# A Brainf**k Interpreter in Zig
 
 
 ## Usage
